@@ -1,13 +1,13 @@
 # high_perf_http
 
 
-- [Quick start](##Quick_start)
-  - [Build](###Build)
-  - [Server](###Server)
-  - [Project](###Project)
-  - [Request](###Request)
-  - [Autotest](###Autotest)
-- [Code architecture]((##Code_architecture))
+- [Quick start](#quick-start)
+  - [Build](#build)
+  - [Server](#server)
+  - [Project](#project)
+  - [Request](#request)
+  - [Autotest](#autotest)
+- [Code architecture]((#code-architecture))
 
 ## Quick start
 ### Build
