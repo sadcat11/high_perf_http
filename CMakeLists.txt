@@ -11,6 +11,7 @@ add_library(hph
     src/http.cpp
     src/proxy.cpp
     src/socket.cpp
+    src/logger.cpp
 )
 
 target_include_directories(hph PUBLIC include)

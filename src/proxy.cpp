@@ -1,6 +1,7 @@
 #include "proxy.hpp"
 #include "http.hpp"
 #include "socket.hpp"
+#include "logger.hpp"
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -18,14 +19,35 @@
 #define DEBUG
 
 #ifdef DEBUG
-#include <mutex>
+#include <arpa/inet.h>
+#include <netdb.h>
 #endif
 
 namespace hph
 {
     namespace
     {
+#ifdef DEBUG
+        std::string client_address_to_string(const sockaddr_storage& address)
+        {
+            char host[NI_MAXHOST]{};
 
+            const int error = ::getnameinfo(reinterpret_cast<const sockaddr*>(&address),
+                                            sizeof(address),
+                                            host,
+                                            sizeof(host),
+                                            nullptr,
+                                            0,
+                                            NI_NUMERICHOST);
+
+            if (error != 0)
+            {
+                return "unknown";
+            }
+
+            return host;
+        }
+#endif
         std::string to_lower(std::string value)
         {
             std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character)
@@ -70,34 +92,14 @@ namespace hph
             return data;
         }
 
-#ifdef DEBUG
-        std::mutex log_mutex;
-        void log_request(const HttpRequest& request, std::string_view client_address)
-        {
-            std::lock_guard<std::mutex> lock(log_mutex);
-
-            std::cout << client_address << " " << request.method << " " << request.target << "\n";
-        }
-
-        void log_response(const HttpRequest& request, std::string_view response_data)
-        {
-            const auto line_end = response_data.find("\r\n");
-
-            if (line_end == std::string_view::npos)
-            {
-                return;
-            }
-
-            std::lock_guard<std::mutex> lock(log_mutex);
-
-            std::cout << request.method << " target: " << request.target
-                      << " data: " << response_data.substr(0, line_end) << "\n";
-        }
-#endif
-
-        void handle_client(int client_fd, const ProxyConfig &config)
+        void handle_client(int client_fd,
+                           const ProxyConfig &config,
+                           const sockaddr_storage& client_address)
         {
             FileDescriptor client(client_fd);
+#ifdef DEBUG
+            const auto client_ip = client_address_to_string(client_address);
+#endif
             const auto raw_request = receive_request(client.get());
             const auto request = parse_request(raw_request);
 
@@ -111,7 +113,7 @@ namespace hph
                 return;
             }
 #ifdef DEBUG
-            log_request(*request, "127.0.0.1");
+            hph::log_request(*request, client_ip);
 #endif
             FileDescriptor backend = connect_backend(config);
 
@@ -214,7 +216,7 @@ namespace hph
             if (!response_data.empty())
             {
 #ifdef DEBUG
-                log_response(*request, response_data);
+                hph::log_response(*request, response_data);
 #endif
                 send_all(client.get(), response_data);
             }
@@ -245,7 +247,7 @@ namespace hph
                 std::cerr << "Accept failed: " << std::strerror(errno) << "\n";
                 return 1;
             }
-            std::thread(handle_client, client, std::cref(config)).detach();
+            std::thread(handle_client, client, std::cref(config), address).detach();
         }
     }
 
