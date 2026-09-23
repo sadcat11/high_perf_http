@@ -2,6 +2,7 @@
 #include "http.hpp"
 #include "socket.hpp"
 #include "logger.hpp"
+#include "http_reader.hpp"
 #include <array>
 #include <cerrno>
 #include <cstring>
@@ -92,6 +93,97 @@ namespace hph
             return data;
         }
 
+        std::optional<std::string> receive_response(int fd)
+        {
+            hph::HttpResponseReader reader;
+
+            std::array<char, 8192> buffer{};
+            pollfd descriptor{fd, POLLIN, 0};
+
+            while (true)
+            {
+                const int ready = ::poll(&descriptor, 1, 5000);
+
+                if (ready < 0)
+                {
+                    if (errno == EINTR)
+                    {
+                        continue;
+                    }
+                    return std::nullopt;
+                }
+
+                if (ready == 0)
+                {
+                    return std::nullopt;
+                }
+
+                if (descriptor.revents & POLLNVAL)
+                {
+                    return std::nullopt;
+                }
+
+                if (descriptor.revents & POLLERR)
+                {
+                    return std::nullopt;
+                }
+#ifdef DEBUG
+                std::cerr << "poll revents = " << descriptor.revents << "\n";
+#endif
+                const auto count = ::recv(fd, buffer.data(), buffer.size(), 0);
+#ifdef DEBUG
+                std::cerr << "recv count = " << count << "\n";
+#endif
+                if (count < 0)
+                {
+                    if (errno == EINTR)
+                    {
+                        continue;
+                    }
+
+                    return std::nullopt;
+                }
+
+                if (count > 0)
+                {
+                    const auto status = reader.consume(
+                        std::string_view(
+                            buffer.data(),
+                            static_cast<std::size_t>(count)
+                        )
+                    );
+#ifdef DEBUG
+                    std::cerr << "reader status = " << static_cast<int>(status) << "\n";
+#endif
+                    if (status == hph::ReaderStatus::error)
+                    {
+                        return std::nullopt;
+                    }
+
+                    if (status == hph::ReaderStatus::complete)
+                    {
+                        return reader.take_response();
+                    }
+
+                    continue;
+                }   
+
+                return std::nullopt;
+            }
+        }
+
+        void send_error(int client_fd,
+                        std::uint16_t status,
+                        std::string reason,
+                        std::string body)
+        {
+            const auto response = make_error_response(status,
+                                                      std::move(reason),
+                                                      std::move(body));
+
+            send_all(client_fd, serialize_response(response));
+        }
+
         void handle_client(int client_fd,
                            const ProxyConfig &config,
                            const sockaddr_storage& client_address)
@@ -105,11 +197,7 @@ namespace hph
 
             if (!request)
             {
-                const auto response = make_error_response(400,
-                                                          "Bad Request",
-                                                          "invalid HTTP request\n");
-
-                send_all(client.get(), serialize_response(response));
+                send_error(client.get(), 400, "Bad Request", "invalid HTTP request\n");
                 return;
             }
 #ifdef DEBUG
@@ -119,107 +207,30 @@ namespace hph
 
             if (backend.get() < 0)
             {
-                const auto response = make_error_response(502,
-                                                          "Bad Gateway",
-                                                          "backend unavailable\n");
-
-                send_all(client.get(), serialize_response(response));
+                send_error(client.get(), 502, "Bad Gateway", "backend unavailable\n");
                 return;
             }
 
             if (!send_all(backend.get(), raw_request))
             {
-                const auto response = make_error_response(502,
-                                                          "Bad Gateway",
-                                                          "backend write failed\n");
-
-                send_all(client.get(), serialize_response(response));
+                send_error(client.get(), 502, "Bad Gateway", "backend write failed\n");
                 return;
             }
 
-            std::string response_data;
-            std::array<char, 8192> buffer{};
-            pollfd descriptor{backend.get(), POLLIN, 0};
+            const auto response = receive_response(backend.get());
 
-            std::size_t header_end = std::string::npos;
-            std::size_t expected_body_size = 0;
-            bool has_content_length = false;
-
-            while (true)
-            {
-                const int ready = ::poll(&descriptor, 1, 5000);
-
-                if (ready <= 0 || !(descriptor.revents & POLLIN))
-                {
-                    break;
-                }
-
-                const auto count = ::recv(backend.get(), buffer.data(), buffer.size(), 0);
-
-                if (count <= 0)
-                {
-                    break;
-                }
-
-                response_data.append(buffer.data(), static_cast<std::size_t>(count));
-
-                if (header_end == std::string::npos)
-                {
-                    header_end = response_data.find("\r\n\r\n");
-
-                    if (header_end == std::string::npos)
-                    {
-                        continue;
-                    }
-
-                    const auto headers = response_data.substr(0, header_end);
-                    const auto lower_headers = to_lower(headers);
-                    const auto length_start = lower_headers.find("content-length:");
-
-                    if (length_start != std::string::npos)
-                    {
-                        const auto value_start = length_start + 15;
-                        const auto value_end = lower_headers.find("\r\n", value_start);
-
-                        if (value_end != std::string::npos)
-                        {
-                            try
-                            {
-                                expected_body_size =
-                                    std::stoull(headers.substr(value_start,
-                                                               value_end - value_start));
-
-                                has_content_length = true;
-                            }
-                            catch (const std::exception &)
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (header_end == std::string::npos)
-                {
-                    continue;
-                }
-
-                const auto body_start = header_end + 4;
-                const auto received_body_size = response_data.size() - body_start;
-
-                if (has_content_length && received_body_size >= expected_body_size)
-                {
-                    break;
-                }
-            }
-
-            if (!response_data.empty())
+            if (!response)
             {
 #ifdef DEBUG
-                hph::log_response(*request, response_data);
+                std::cerr << "receive_response failed\n";
 #endif
-                send_all(client.get(), response_data);
+                send_error(client.get(), 502, "Bad Gateway", "backend response failed\n");
+                return;
             }
+#ifdef DEBUG
+            hph::log_response(*request, *response);
+#endif
+            send_all(client.get(), *response);
         }
 
     }
